@@ -1623,7 +1623,8 @@ function openQuests(){ if(!QS.def){ toast('Úkoly se nepodařilo načíst.'); re
 // ======================= HRA PRO VÍCE HRÁČŮ (room: presence) =======================
 // Každý hráč řídí svou loď sám; poloha, zdraví a salvy se sdílejí přes presence.
 // O zásahu rozhoduje zasažený hráč (jeho klient); v bezpečné zóně u přístavů se nebojuje.
-const MP={room:null,user:null,me:null,remotes:new Map(),seq:0,sv:[],sentT:0,deaths:0,kb:null,names:{},ready:false,conn:false};
+const MP={room:null,user:null,me:null,remotes:new Map(),seq:0,sv:[],sentT:0,deaths:0,kb:null,names:{},ready:false,conn:false,
+  gnpc:new Map(), nsv:[], nsvSeq:0, nh:[], nhSeq:0, nhPend:new Map(), uidSeq:0, npT:0};   // gnpc: NPC lodě jiných hráčů (sdílené), nsv: salvy mých NPC, nh: mé zásahy cizích NPC
 function mpName(r){ return (r&&r.by&&MP.names[r.by]) || (r&&r.nm) || 'Kapitán'; }
 async function mpResolveNames(ids){ if(!MP.user||!ids.length) return; try{ const ps=await MP.user.profiles(ids); for(const id of ids){ const p=ps&&ps[id]; MP.names[id]=(p&&p.name)||MP.names[id]||'Kapitán'; } updMpChip(); }catch(e){} }
 // vlastní server (hra mimo Claude): stejné rozhraní jako room, přes WebSocket /mp
@@ -1695,7 +1696,7 @@ async function initMP(){
     room.onPeers(ch=>{
       for(const p of ch.peers) if(p.sameTab) MP.me=p.peer;
       const need=[]; for(const p of ch.peers) if(p.by && !MP.names[p.by]) need.push(p.by); if(need.length) mpResolveNames(need);
-      for(const p of ch.left){ const r=MP.remotes.get(p.peer); if(r){ MP.remotes.delete(p.peer); toast(mpName(r)+' odplouvá z moře.'); } }
+      for(const p of ch.left){ const r=MP.remotes.get(p.peer); if(r){ MP.remotes.delete(p.peer); toast(mpName(r)+' odplouvá z moře.'); } for(const g of MP.gnpc.values()) if(g.owner===p.peer) g.gone=true; }
       for(const p of ch.peers){ if(p.sameTab||p.kind!=='viewer') continue; mpUpdatePeer(p); }
       updMpChip(); MP.ready=true; }, ()=>{});
   }catch(e){ MP.room=null; }
@@ -1715,10 +1716,83 @@ function mpUpdatePeer(p){
   for(const s of sv){ if((s.i|0)<=r.lastSv) continue; if(r.m && Math.hypot((+s.x)-player.x,(+s.y)-player.y)<7000 && 'RLFA'.includes(s.a)){
       const sh={x:+s.x,y:+s.y,heading:+s.h,m:r.m,cs:r.cs||combatStats(r.m)}; fireSalvo(sh,s.a,+s.tx,+s.ty,0.07,r); } }
   r.lastSv=Math.max(r.lastSv,mx);
+  mpNpcIn(p.peer, r, q);
   // potopení mou palbou = odměna
   const dc=q.dc|0; if(dc>r.lastDc){ r.lastDc=dc; if(q.kb && q.kb===MP.me && r.m){ qEv('pvp'); } if(q.kb && q.kb===MP.me && r.m) reward(220+Math.round(r.m.hull*0.6),'Potopil jsi loď hráče '+mpName(r)+'!',{k:'pvp'}); }
 }
 function mpRecordSalvo(arc,tx,ty){ if(!MP.room) return; MP.sv.push({i:++MP.seq,a:arc,x:Math.round(player.x),y:Math.round(player.y),h:Math.round(player.heading*1000)/1000,tx:Math.round(tx),ty:Math.round(ty)}); if(MP.sv.length>4) MP.sv.shift(); MP.sentT=0; }
+// ======================= sdílené NPC lodě =======================
+// Každý hráč simuluje své NPC (jako dřív) a ty, které jsou poblíž jiných hráčů, posílá v presence.
+// Ostatní je vidí jako „cizí NPC“: plynule je posouvají, přehrávají jejich salvy (zásah do vlastní lodi si počítá každý sám)
+// a jejich zásahy cizích NPC posílají zpět vlastníkovi, který je započítá. Odměnu za potopení dostane ten, kdo dal poslední ránu.
+const NP_R=9000;      // NPC do této vzdálenosti od jiného hráče se sdílí
+function npPeer(v){ return v==='me'?(MP.me||0):(v||0); }
+function npLocal(v){ return v && v===MP.me ? 'me' : (v||null); }
+function mpNpcOut(){
+  const out={}; const rs=[...MP.remotes.values()].filter(r=>!r.dk && !r.gh && r.m);
+  // NPC salvy a zásahy cizích NPC se posílají vždy (s pořadovým číslem, ať se nic neztratí ani nezdvojí)
+  for(const h of MP.nhPend.values()){ MP.nh.push({i:++MP.nhSeq,o:h.o,u:h.u,d:Math.round(h.d),c:h.c}); } MP.nhPend.clear(); if(MP.nh.length>8) MP.nh.splice(0,MP.nh.length-8);
+  out.nh=MP.nh.length?MP.nh:null; out.nsv=MP.nsv.length?MP.nsv:null;
+  MP.npT=(MP.npT+1)%2; if(MP.npT){ out.np=null; return out; }          // stav NPC každou druhou zprávu (≈6× za s)
+  const L=[];
+  if(rs.length) for(const n of npcs){ if(n.x<-1e5 || !n.m) continue;
+    const eng=n.st==='fight'||n.st==='flee'||(n.st==='sink'&&n.sinkT<SINK_T+1);
+    if(!n.amb && !eng) continue;                              // obchodníci na trase se sdílí jen v boji (jinak by se u přístavů zdvojovali)
+    if(n.st==='sink' && !(n.shT>tNow-1.5)) continue;
+    let dm=1e18; for(const r of rs) dm=Math.min(dm,Math.hypot(r.x-n.x,r.y-n.y)); if(dm>NP_R) continue;
+    if(!n.uid) n.uid=++MP.uidSeq; n.shT=tNow; L.push([dm,n]); }
+  L.sort((a,b)=>a[0]-b[0]);
+  out.np=L.slice(0,8).map(([_,n])=>[n.uid,n.id|0,Math.round(n.x),Math.round(n.y),Math.round(n.heading*1000),Math.round(n.speed),Math.max(0,Math.round(n.hp||0)),Math.round(n.maxHp||0),
+    (n.pirate?1:0)|(n.st==='sink'?2:0)|(n.st==='fight'?4:0)|(n.st==='flee'?8:0), n.st==='fight'||n.st==='flee'?npPeer(n.tgt):0, npPeer(n.prov), n.st==='sink'?npPeer(n.kb):0]);
+  return out; }
+function mpNpcSalvo(n,arc,tx,ty){ if(!MP.room || !(n.shT>tNow-1)) return; if(!n.uid) n.uid=++MP.uidSeq;
+  MP.nsv.push({i:++MP.nsvSeq,u:n.uid,a:arc,x:Math.round(n.x),y:Math.round(n.y),h:Math.round(n.heading*1000)/1000,tx:Math.round(tx),ty:Math.round(ty)}); if(MP.nsv.length>6) MP.nsv.shift(); MP.sentT=Math.min(MP.sentT,0.02); }
+function mpNpcHit(g,d,c){ const k=g.owner+':'+g.uid, h=MP.nhPend.get(k)||{o:g.owner,u:g.uid,d:0,c:0}; h.d+=d; h.c|=c?1:0; MP.nhPend.set(k,h); MP.sentT=Math.min(MP.sentT,0.02); }
+function mpNpcIn(peer,r,q){
+  // 1) stav jeho NPC
+  if(Array.isArray(q.np)){ const seen=new Set();
+    for(const a of q.np.slice(0,10)){ if(!Array.isArray(a)||a.length<9) continue; const uid=a[0]|0, id=a[1]|0, key=peer+':'+uid; const m=shipsMeta.ships.find(s=>s.id===id); if(!m) continue; seen.add(key);
+      let g=MP.gnpc.get(key);
+      if(!g){ g={ghost:true,owner:peer,uid,id,m,x:+a[2],y:+a[3],heading:(+a[4])/1000,speed:0,alpha:0,st:'roam',sinkT:0,cs:combatStats(m)}; MP.gnpc.set(key,g); }
+      if(g.id!==id){ g.id=id; g.m=m; g.cs=combatStats(m); }
+      g.px=+a[2]; g.py=+a[3]; g.ph=(+a[4])/1000; g.sp=+a[5]||0; g.rt=performance.now(); g.gone=false;
+      const hp=Math.max(0,+a[6]||0); g.maxHp=Math.max(1,+a[7]||1); g.hp=(tNow-(g.hitT??-99))<0.8?Math.min(g.hp??hp,hp):hp;
+      const fl=a[8]|0; g.pirate=!!(fl&1); g.tgt=npLocal(a[9]); g.pv=a[10]||0; g.kb=a[11]||0;
+      if(fl&2){ if(g.st!=='sink'){ g.st='sink'; g.sinkT=0; g.hp=0; smoke(g.x,g.y,80,10,1.4,0.7); debris(g.x,g.y,60,18);
+          if(g.kb && g.kb===MP.me && !g.rewarded){ g.rewarded=true; qEv('sink',{pirate:g.pirate,id:g.id}); reward(g.pirate? 150+Math.round(m.hull*0.5) : 60+Math.round(m.hull*0.25), g.pirate?'Pirátská loď potopena!':'Obchodní loď potopena.', {k:'npc',p:g.pirate?1:0,s:g.id}); } } }
+      else g.st=(fl&4)?'fight':(fl&8)?'flee':'roam'; }
+    for(const [k,g] of MP.gnpc) if(g.owner===peer && !seen.has(k)) g.gone=true; }
+  // 2) salvy jeho NPC (zásah do mé lodi si spočítám sám, stejně jako u hráčů)
+  const nsv=Array.isArray(q.nsv)?q.nsv:[]; let mx=0; for(const v of nsv) mx=Math.max(mx,v.i|0);
+  if(r.lastNsv===undefined) r.lastNsv=mx;
+  for(const v of nsv){ if((v.i|0)<=r.lastNsv || !'RLFA'.includes(v.a)) continue; const g=MP.gnpc.get(peer+':'+(v.u|0)); if(!g||g.st==='sink') continue;
+    if(Math.hypot((+v.x)-player.x,(+v.y)-player.y)<7000){ const sh={x:+v.x,y:+v.y,heading:+v.h,m:g.m,cs:g.cs}; fireSalvo(sh,v.a,+v.tx,+v.ty,0.16,g); } }
+  r.lastNsv=Math.max(r.lastNsv,mx);
+  // 3) jeho zásahy mých NPC
+  const nh=Array.isArray(q.nh)?q.nh:[]; let mh=0; for(const h of nh) mh=Math.max(mh,h.i|0);
+  if(r.lastNh===undefined) r.lastNh=mh;
+  for(const h of nh){ if((h.i|0)<=r.lastNh || h.o!==MP.me) continue; npcRemoteHit(h.u|0, Math.max(0,Math.min(900,+h.d||0)), !!h.c, peer); }
+  r.lastNh=Math.max(r.lastNh,mh); }
+function npcRemoteHit(uid,d,chain,peer){ const n=npcs.find(x=>x.uid===uid); if(!n||n.st==='sink'||!(d>0)) return;
+  n.hp-=d; n.hurt=1; if(chain) n.slowT=6; n.prov=peer; n.tgt=peer; n.st=n.pirate?'fight':'flee'; n.aggroT=0;
+  debris(n.x,n.y,60,4); if(n.hp<=0) sinkNPC(n,peer); }
+function mpGhostTick(dt){
+  for(const [k,g] of MP.gnpc){
+    const age=Math.min(1.2,(performance.now()-(g.rt||0))/1000);
+    if(age>=1.2 && !g.gone && performance.now()-(g.rt||0)>2500) g.gone=true;            // vlastník přestal posílat
+    g.alpha=g.gone?Math.max(0,g.alpha-dt*1.5):Math.min(1,g.alpha+dt*2);
+    if(g.gone && g.alpha<=0){ MP.gnpc.delete(k); if(player.target===g) player.target=null; continue; }
+    g.hurt=Math.max(0,(g.hurt||0)-dt*3); if(g.slowT>0) g.slowT-=dt;
+    if(g.st==='sink'){ g.sinkT+=dt; g.x+=Math.cos(g.heading)*g.speed*dt; g.y+=Math.sin(g.heading)*g.speed*dt; g.speed*=Math.pow(0.4,dt);
+      if(Math.random()<dt*6) bubbles(g.x,g.y,1,g.m.hull*0.4); if(g.sinkT<2 && Math.random()<dt*8) smoke(g.x,g.y,70,1,1.3,0.7);
+      if(g.rewarded && !g.chestDone && g.sinkT>2.4){ g.chestDone=true; dropChest(g.x,g.y,g.id); }
+      if(g.sinkT>SINK_T+0.5) g.gone=true; continue; }
+    const tx=g.px+Math.cos(g.ph)*g.sp*age, ty=g.py+Math.sin(g.ph)*g.sp*age;
+    if(Math.hypot(tx-g.x,ty-g.y)>2500){ g.x=tx; g.y=ty; } else { const kk=Math.min(1,dt*6); g.x+=(tx-g.x)*kk; g.y+=(ty-g.y)*kk; }
+    g.heading+=Math.atan2(Math.sin(g.ph-g.heading),Math.cos(g.ph-g.heading))*Math.min(1,dt*6); g.speed=g.sp;
+    if(g.hp<g.maxHp*0.5 && Math.random()<dt*3) smoke(g.x,g.y,90,1,1,0.7);
+    if(g.speed>20 && Math.random()<dt*10 && Math.abs(g.x-cam.x)<6000 && Math.abs(g.y-cam.y)<6000) wake.push({x:g.x-Math.cos(g.heading)*g.m.hull*0.42,y:g.y-Math.sin(g.heading)*g.m.hull*0.42,vx:0,vy:0,r:g.m.hull*0.08,a:0.6*g.alpha,t:0,g:g.m.hull}); } }
+function ghostsNear(x,y,r){ let c=0; for(const g of MP.gnpc.values()) if(!g.gone && g.st!=='sink' && Math.hypot(g.x-x,g.y-y)<r) c++; return c; }
 function mpTick(dt){
   if(!MP.room) return;
   // vzdálení hráči: plynulý dojezd k poslední známé poloze s předpovědí
@@ -1728,8 +1802,10 @@ function mpTick(dt){
     let dh=Math.atan2(Math.sin(r.ph-r.heading),Math.cos(r.ph-r.heading)); r.heading+=dh*Math.min(1,dt*6);
     if(r.dead){ r.deadT+=dt; if(!r.chestDone && r.deadT>2.4){ r.chestDone=true; dropChest(r.x,r.y,r.id); } } else r.chestDone=false;
     if(!r.dead && r.m && r.speed>20 && Math.random()<dt*10 && Math.abs(r.x-cam.x)<6000 && Math.abs(r.y-cam.y)<6000) wake.push({x:r.x-Math.cos(r.heading)*r.m.hull*0.42,y:r.y-Math.sin(r.heading)*r.m.hull*0.42,vx:0,vy:0,r:r.m.hull*0.08,a:0.6,t:0,g:r.m.hull}); }
+  mpGhostTick(dt);
   MP.sentT-=dt; if(MP.sentT>0 || !ship) return; MP.sentT=0.08;
-  MP.room.presence({v:1,x:Math.round(player.x),y:Math.round(player.y),h:Math.round(player.heading*1000)/1000,sp:Math.round(player.speed),id:player.shipId|0,ug:upgOf(player.shipId).join(''),
+  const npx=mpNpcOut();
+  MP.room.presence({...npx, v:1,x:Math.round(player.x),y:Math.round(player.y),h:Math.round(player.heading*1000)/1000,sp:Math.round(player.speed),id:player.shipId|0,ug:upgOf(player.shipId).join(''),
     hp:Math.round(player.hp||0),mh:Math.round(player.maxHp||0),dead:!!player.dead,dk:player.docked?1:0,sv:MP.sv,kb:MP.kb,dc:MP.deaths,nm:MP.nick||null}).catch(()=>{});
 }
 // bezpečné vody: velký kruh uprostřed mapy + okolí přístavů (na hráče se tu nesmí útočit)
@@ -1853,7 +1929,7 @@ function ambWaypoint(n){ // cíl daleko za hráčem – lodě protínají okolí
 function makeAmb(k,small){ const pirate=Math.random()<0.34; let ids=npcPool(pirate,!!small); const ld=ids.filter(i=>shipTex.has(i)); if(ld.length>=3 && Math.random()<0.8) ids=ld; const id=ids[Math.floor(Math.random()*ids.length)];
   const m=shipsMeta.ships.find(x=>x.id===id); if(!m) return null; const L=m.hull;
   return {id,m,x:0,y:0,heading:0,speed:0,vmax:npcV(L),tr:(48-(L-170)*0.06)*Math.PI/180,path:null,ri:0,wait:0,pirate,amb:true,st:'roam',wp:null,stuck:0}; }
-function ambRelocate(n,first){ const [r0,r1]=ambRing(); const p=ringPoint(first?3500:r0, r1, -60, 3500, npcs.filter(q=>q!==n), 900); if(!p) return false;
+function ambRelocate(n,first){ n.uid=0; n.prov=null; n.tgt=null; if(!first && ghostsNear(player.x,player.y,14000)>=4){ n.x=-1e6; n.y=-1e6; n.st='roam'; return false; } const [r0,r1]=ambRing(); const p=ringPoint(first?3500:r0, r1, -60, 3500, npcs.filter(q=>q!==n), 900); if(!p) return false;
   const nm=makeAmb(0, inCentral(p.x,p.y,700)); if(nm){ n.bigId=undefined; n.id=nm.id; n.m=nm.m; n.vmax=nm.vmax; n.tr=nm.tr; n.pirate=nm.pirate; n.cs=null; n.hp=undefined; }
   n.x=p.x; n.y=p.y; n.st='roam'; n.sinkT=0; n.speed=n.vmax*0.6; n.wp=ambWaypoint(n); n.heading=Math.atan2(n.wp[1]-n.y,n.wp[0]-n.x); n.stuck=0; n.hurt=0; n.rel=2+Math.random()*3; return true; }
 function initAmbient(){ for(let k=0;k<AMB.ships;k++){ const n=makeAmb(k); if(!n) continue; npcs.push(n); if(!ambRelocate(n,true)){ n.x=-1e6; n.y=-1e6; } } }
@@ -1995,6 +2071,7 @@ function npcName(n){ return (n.pirate?'Piráti · ':'Obchodník · ')+n.m.name.r
 function targets(){ const out=[];
   for(const r of MP.remotes.values()){ if(r.dead||r.dk||!r.m) continue; out.push({e:r,x:r.x,y:r.y,r:r.m.hull*0.34,h:150,name:mpName(r)+(r.gh?' (odpojen)':'')}); }
   for(const n of npcs){ if(n.st==='sink') continue; out.push({e:n,x:n.x,y:n.y,r:n.m.hull*0.34,h:150,name:npcName(n)}); }
+  for(const g of MP.gnpc.values()){ if(g.st==='sink'||g.gone||g.alpha<0.3) continue; out.push({e:g,x:g.x,y:g.y,r:g.m.hull*0.34,h:150,name:npcName(g)}); }
   for(const m of monsters){ if(m.st==='dead'||m.st==='hidden') continue;
     if(m.type==='kraken'){ const K=m.k||1, nm=K<1?'Malý kraken':'Kraken'; if(m.stage>=1) out.push({e:m,x:m.x,y:m.y,r:170*K,h:260*K,name:nm});
       for(const t of m.tents){ if(t.vis) out.push({e:m,x:t.x,y:t.y,r:70*K,h:260*K,name:nm}); } if(m.atk&&m.atk.vis) out.push({e:m,x:m.atk.bx,y:m.atk.by,r:80*K,h:260*K,name:nm}); }
@@ -2050,7 +2127,9 @@ const GHQ=new Map(); let ghqT=0;
 function ghostHitQ(peer,dmg){ const q=GHQ.get(peer)||{d:0,n:0}; q.d+=dmg; q.n++; GHQ.set(peer,q);
   if(!ghqT) ghqT=setTimeout(()=>{ ghqT=0; for(const [p,q] of GHQ) if(MP.room&&MP.room.send) MP.room.send({t:'hit',peer:p,d:Math.round(q.d),n:q.n}); GHQ.clear(); },120); }
 function hitTarget(t, dmg, bx, by, chain){
-  const e=t.e; if(e.remote){ if(e.dead) return false; debris(bx,by,60,6); smoke(bx,by,60,2,0.8,0.6); flash(bx,by,50,0.7); if(!pvpOff(e,player)){ floatTxt(bx,by,150,Math.round(dmg),'#9fd0ff');
+  const e=t.e;
+  if(e.ghost){ if(e.st==='sink'||e.gone||!(e.hp>0)) return false; e.hp=Math.max(1,e.hp-dmg); e.hitT=tNow; e.hurt=1; if(chain) e.slowT=6; debris(bx,by,60,6); smoke(bx,by,60,2,0.8,0.6); flash(bx,by,50,0.7); floatTxt(bx,by,150,Math.round(dmg),'#ffd27a'); mpNpcHit(e,dmg,chain); return true; }
+  if(e.remote){ if(e.dead) return false; debris(bx,by,60,6); smoke(bx,by,60,2,0.8,0.6); flash(bx,by,50,0.7); if(!pvpOff(e,player)){ floatTxt(bx,by,150,Math.round(dmg),'#9fd0ff');
     // odpojený hráč (loď ještě 15 s na moři): poškození počítá server
     if(e.gh && MP.room && MP.room.send) ghostHitQ(e.peer,dmg); } return true; }
   if(e.st==='sink'||e.st==='dead'||e.hp<=0) return false;
@@ -2062,7 +2141,7 @@ function hitTarget(t, dmg, bx, by, chain){
     if(e.hp<=0) killMonster(e); return true; }
   e.hp-=dmg; e.hurt=1; debris(bx,by,60,6); smoke(bx,by,60,2,0.8,0.6); flash(bx,by,50,0.7);
   floatTxt(bx,by,150,Math.round(dmg),'#ffd27a');
-  if(e.st!=='sink'){ if(e.pirate) e.st='fight'; else e.st='flee'; e.aggroT=0; }
+  if(e.st!=='sink'){ if(e.pirate) e.st='fight'; else e.st='flee'; e.aggroT=0; e.prov='me'; e.tgt='me'; }
   if(e.hp<=0) sinkNPC(e); return true;
 }
 function damagePlayer(dmg,x,y){
@@ -2074,7 +2153,7 @@ function damagePlayer(dmg,x,y){
 const REPAIR_COST=0.6, REPAIR_S=35;   // celá oprava bez tesařů trvá 35 s
 function repCost(){ const cs=ship?(player.cs||combatStats(ship,upgOf(player.shipId))):null; return REPAIR_COST*(cs?cs.repC:1); }
 function repairInfo(){ const miss=Math.max(0,(player.maxHp||0)-(player.hp||0)-((player.repair&&player.repair.left)||0)); return {miss, cost:Math.ceil(miss*repCost())}; }
-function inCombat(){ return npcs.some(n=>n.st==='fight' && Math.hypot(n.x-player.x,n.y-player.y)<2200) || monsters.some(m=>m.aggro && m.st!=='dead' && Math.hypot(m.x-player.x,m.y-player.y)<2600) || (tNow-(player.hitT??-99))<6; }
+function inCombat(){ return npcs.some(n=>n.st==='fight' && n.tgt==='me' && Math.hypot(n.x-player.x,n.y-player.y)<2200) || [...MP.gnpc.values()].some(g=>g.st==='fight' && g.tgt==='me' && !g.gone && Math.hypot(g.x-player.x,g.y-player.y)<2200) || monsters.some(m=>m.aggro && m.st!=='dead' && Math.hypot(m.x-player.x,m.y-player.y)<2600) || (tNow-(player.hitT??-99))<6; }
 // zakotvit nejde uprostřed boje – ani krátce po vlastní salvě na cíl (útěk do přístavu by sebral výhru soupeři)
 function dockBlocked(){ return inCombat() || (tNow-(player.fireT??-99))<6; }
 function startRepair(){
@@ -2094,7 +2173,8 @@ function updateRepair(dt){ const r=player.repair; if(!r) return; if(player.dead)
   if(Math.random()<dt*5){ const a=Math.random()*6.28, rr=ship.hull*0.25*Math.random(); addFx(player.x+Math.cos(a)*rr,player.y+Math.sin(a)*rr*0.5,60,0,0,40,4,6,0.5,[0.95,0.85,0.55,0.8]); }
   if(r.left<=0.01 || player.hp>=player.maxHp){ player.repair=null; toast('Loď je opravená.'); } }
 function reward(v,txt,ev){ if(!(PG.mode==='server' && ev && ev.k==='pvp')) gold+=v; floatTxt(player.x,player.y,260,'+'+v+' zl.','#f2c14e'); toast(txt+'  +'+v+' zlaťáků'); pgSaveLocal(); if(ev && ev.k!=='pvp') pgEvent(ev); }
-function sinkNPC(n){ if(n.st==='sink') return; n.st='sink'; n.sinkT=0; n.chestDone=false; n.hp=0; smoke(n.x,n.y,80,10,1.4,0.7); debris(n.x,n.y,60,18);
+function sinkNPC(n,killer){ if(n.st==='sink') return; n.st='sink'; n.sinkT=0; n.chestDone=false; n.hp=0; smoke(n.x,n.y,80,10,1.4,0.7); debris(n.x,n.y,60,18);
+  n.kb=killer||'me'; if(killer){ n.chestDone=true; return; }   // potopil ho jiný hráč – odměnu i truhlu dostane on
   qEv('sink',{pirate:!!n.pirate,id:n.id});
   reward(n.pirate? 150+Math.round(n.m.hull*0.5) : 60+Math.round(n.m.hull*0.25), n.pirate?'Pirátská loď potopena!':'Obchodní loď potopena.', {k:'npc',p:n.pirate?1:0,s:n.id}); }
 function killMonster(m){ if(m.st==='dead') return; qEv('mon',m.type); m.st='dead'; m.deadT=0; m.hp=0; ink(m.x,m.y,14); splash(m.x,m.y,2); reward(Math.round((m.type==='kraken'?700:450)*(m.k||1)), m.type==='kraken'?'Kraken poražen!':'Mořský had poražen!', {k:'mon',t:m.type}); }
@@ -2201,6 +2281,13 @@ function steerNPC(n, want, spd, dt){
   n.speed+=(spd*(Math.abs(a)>1.2?0.55:1)*slowF(n)-n.speed)*Math.min(1,dt*0.6);
   const nx=n.x+Math.cos(n.heading)*n.speed*dt, ny=n.y+Math.sin(n.heading)*n.speed*dt; if(!blocked(nx,ny)){ n.x=nx; n.y=ny; } else { n.speed*=0.5; n.heading+=(n.side||1)*n.tr*dt; }
 }
+// cíl NPC: 'me' (můj kapitán) nebo id jiného hráče
+function foeOf(n){ const t=n.tgt; if(t==='me') return (!player.dead && !player.docked)?player:null;
+  if(t){ const r=MP.remotes.get(t); if(r && !r.dead && !r.dk && !r.gh && r.m) return r; } return null; }
+function pickFoe(n,R){ let best=null, bd=R;
+  if(!player.dead && !player.docked){ const d=Math.hypot(player.x-n.x,player.y-n.y); if(d<bd && (!mpSafe(player.x,player.y)||n.prov==='me')){ bd=d; best='me'; } }
+  for(const r of MP.remotes.values()){ if(r.dead||r.dk||r.gh||!r.m) continue; const d=Math.hypot(r.x-n.x,r.y-n.y); if(d<bd && (!mpSafe(r.x,r.y)||n.prov===r.peer)){ bd=d; best=r.peer; } }
+  return best; }
 function updateCombat(dt){
   if(!ship) return;
   player.cs=player.cs&&player.m===ship?player.cs:combatStats(ship,upgOf(player.shipId)); player.m=ship;
@@ -2208,7 +2295,7 @@ function updateCombat(dt){
   if(player.maxHp!==player.cs.maxHp){ const f=player.hp/player.maxHp; player.maxHp=player.cs.maxHp; player.hp=Math.round(player.maxHp*f); }
   if(!player.rel||Array.isArray(player.rel)) player.rel={R:0,L:0,F:0,A:0}; for(const k in player.rel) player.rel[k]=Math.max(0,player.rel[k]-dt);
   player.slowT=Math.max(0,(player.slowT||0)-dt); updateRepair(dt); for(const n of npcs) if(n.slowT>0) n.slowT-=dt; for(const m of monsters) if(m.slowT>0) m.slowT-=dt;
-  if(player.target && (player.target.st==='sink'||player.target.st==='dead'||player.target.st==='hidden')) player.target=null;
+  if(player.target && (player.target.st==='sink'||player.target.st==='dead'||player.target.st==='hidden'||player.target.gone)) player.target=null;
   // potopení hráče
   if(player.dead){ player.sinkT+=dt; if(Math.random()<dt*10) bubbles(player.x,player.y,2,ship.hull*0.4); if(player.sinkT>0.2 && player.sinkT<2.6 && Math.random()<dt*5) splash(player.x+(Math.random()-0.5)*ship.hull*0.6,player.y+(Math.random()-0.5)*ship.hull*0.3,0.7); if(Math.random()<dt*6) smoke(player.x,player.y,60,1,1.2,0.6);
     if(player.sinkT>SINK_T){ let best=world.ports[0],bd=1e18; for(const P of world.ports){ const d=Math.hypot(P.wx-player.x,P.wy-player.y); if(d<bd){bd=d;best=P;} }
@@ -2225,24 +2312,26 @@ function updateCombat(dt){
       if(!n.chestDone && n.sinkT>2.4){ n.chestDone=true; dropChest(n.x,n.y,n.id); }
       if(n.sinkT>0.2 && n.sinkT<2.6 && Math.random()<dt*5) splash(n.x+(Math.random()-0.5)*n.m.hull*0.6,n.y+(Math.random()-0.5)*n.m.hull*0.3,0.7);
       if(n.amb){ if(n.sinkT>14) ambRelocate(n); continue; }
-      if(n.sinkT>50){ const P=world.ports[Math.floor(Math.random()*5)], s=spawnNear(P); n.x=s.x; n.y=s.y; n.hp=n.maxHp; n.st='travel'; n.path=null; n.from=P; n.to=world.ports[(world.ports.indexOf(P)+2)%5]; npcQueue.push(n); }
+      if(n.sinkT>50){ const P=world.ports[Math.floor(Math.random()*5)], s=spawnNear(P); n.uid=0; n.prov=null; n.tgt=null; n.x=s.x; n.y=s.y; n.hp=n.maxHp; n.st='travel'; n.path=null; n.from=P; n.to=world.ports[(world.ports.indexOf(P)+2)%5]; npcQueue.push(n); }
       continue; }
-    const safe=world.ports.some(P=>Math.hypot(P.wx-player.x,P.wy-player.y)<5200);
-    if((!n.st||n.st==='travel'||n.st==='roam') && n.pirate && d<2200 && !player.dead && !safe){ n.st='fight'; n.aggroT=0; }
-    if(n.st==='fight'){
-      const ang=Math.atan2(player.y-n.y,player.x-n.x); let want;
+    if((!n.st||n.st==='travel'||n.st==='roam') && n.pirate && n.x>-1e5 && !(n.calmT>tNow)){ const f=pickFoe(n,2200); if(f){ n.st='fight'; n.tgt=f; n.aggroT=0; } }
+    let F=null, fd=1e9;
+    if(n.st==='fight'||n.st==='flee'){ F=foeOf(n); if(!F && n.st==='fight'){ const f=pickFoe(n,2600); if(f){ n.tgt=f; F=foeOf(n); } }
+      if(F) fd=Math.hypot(F.x-n.x,F.y-n.y);
+      // cíl v bezpečných vodách: NPC útočí jen na toho, kdo ho sám napadl
+      if(!F || (n.st==='fight' && (fd>4500 || (mpSafe(F.x,F.y) && n.prov!==n.tgt))) || (n.st==='flee' && fd>4200)){ if(F && mpSafe(F.x,F.y)) n.calmT=tNow+5; endEngage(n); F=null; } }
+    if(n.st==='fight' && F){
+      const ang=Math.atan2(F.y-n.y,F.x-n.x); let want; const d=fd;
       if(d>1150) want=ang; else if(d<520) want=ang+Math.PI*0.75*(n.orbit||1);
       else { const a1=ang+Math.PI/2, a2=ang-Math.PI/2; const d1=Math.abs(Math.atan2(Math.sin(a1-n.heading),Math.cos(a1-n.heading))), d2=Math.abs(Math.atan2(Math.sin(a2-n.heading),Math.cos(a2-n.heading))); want=d1<d2?a1:a2; n.orbit=d1<d2?1:-1; }
       steerNPC(n,want,n.vmax*0.85,dt);
       // palba
-      if(n.rel<=0 && d<1500 && !player.dead){ const arc=arcFor(n.heading,player.x-n.x,player.y-n.y), bA=n.heading+ARC[arc].a;
-        const cosA=((player.x-n.x)*Math.cos(bA)+(player.y-n.y)*Math.sin(bA))/Math.max(1,d); if(cosA>(arc==='F'||arc==='A'?0.88:0.72)){ const lead=d/BALL_V; const r=fireSalvo(n,arc,player.x+Math.cos(player.heading)*player.speed*lead,player.y+Math.sin(player.heading)*player.speed*lead,0.16,n); n.rel=r*1.5+Math.random()*1.5; } }
-      if(d>4500 || player.dead || (safe && n.hp>=n.maxHp)) endEngage(n);
+      if(n.rel<=0 && d<1500){ const arc=arcFor(n.heading,F.x-n.x,F.y-n.y), bA=n.heading+ARC[arc].a;
+        const cosA=((F.x-n.x)*Math.cos(bA)+(F.y-n.y)*Math.sin(bA))/Math.max(1,d); if(cosA>(arc==='F'||arc==='A'?0.88:0.72)){ const lead=d/BALL_V, tx=F.x+Math.cos(F.heading||0)*(F.speed||0)*lead, ty=F.y+Math.sin(F.heading||0)*(F.speed||0)*lead; const r=fireSalvo(n,arc,tx,ty,0.16,n); mpNpcSalvo(n,arc,tx,ty); n.rel=r*1.5+Math.random()*1.5; } }
       if(Math.random()<dt*10 && n.speed>20) wake.push({x:n.x-Math.cos(n.heading)*n.m.hull*0.42,y:n.y-Math.sin(n.heading)*n.m.hull*0.42,vx:0,vy:0,r:n.m.hull*0.08,a:0.6,t:0,g:n.m.hull});
     } else if(n.st==='roam'){ ambSteer(n,dt);
-    } else if(n.st==='flee'){
-      const ang=Math.atan2(n.y-player.y,n.x-player.x); steerNPC(n,ang,n.vmax,dt);
-      if(d>4200) endEngage(n);
+    } else if(n.st==='flee' && F){
+      const ang=Math.atan2(n.y-F.y,n.x-F.x); steerNPC(n,ang,n.vmax,dt);
       if(Math.random()<dt*10 && n.speed>20) wake.push({x:n.x-Math.cos(n.heading)*n.m.hull*0.42,y:n.y-Math.sin(n.heading)*n.m.hull*0.42,vx:0,vy:0,r:n.m.hull*0.08,a:0.6,t:0,g:n.m.hull});
     }
     if(n.hp<n.maxHp*0.5 && Math.random()<dt*3) smoke(n.x,n.y,90,1,1,0.7);
@@ -2255,7 +2344,7 @@ function updateCombat(dt){
   for(let i=balls.length-1;i>=0;i--){ const b=balls[i];
     b.vz-=G_BALL*dt; b.x+=b.vx*dt; b.y+=b.vy*dt; b.z+=b.vz*dt; let gone=false;
     if(b.owner===player){ for(const t of T){ if(b.z<t.h && Math.hypot(b.x-t.x,b.y-t.y)<t.r){ if(hitTarget(t,b.dmg,b.x,b.y,b.chain)){ if(b.chain) qEv('chain'); else if(b.arc==='A') qEv('stern'); gone=true; break; } } } }
-    else if(!player.dead && b.z<150 && Math.hypot(b.x-player.x,b.y-player.y)<ship.hull*0.34){ if(b.owner&&b.owner.remote){ if(!pvpOff(player,b.owner)){ player.lastHitBy=b.owner.peer; player.lastHitAt=tNow; damagePlayer(b.dmg,b.x,b.y); } else splash(b.x,b.y,0.6); } else damagePlayer(b.dmg,b.x,b.y); if(b.chain && !(b.owner&&b.owner.remote&&pvpOff(player,b.owner))){ player.slowT=6; toast('Řetězové koule ti poškodily lanoví!'); } gone=true; }
+    else if(!player.dead && b.z<150 && Math.hypot(b.x-player.x,b.y-player.y)<ship.hull*0.34){ if(b.owner && !b.owner.remote && b.owner!==player && !b.owner.type && mpSafe(player.x,player.y) && !(b.owner.ghost ? b.owner.pv===MP.me : b.owner.prov==='me')){ splash(b.x,b.y,0.6); gone=true; } else if(b.owner&&b.owner.remote){ if(!pvpOff(player,b.owner)){ player.lastHitBy=b.owner.peer; player.lastHitAt=tNow; damagePlayer(b.dmg,b.x,b.y); } else splash(b.x,b.y,0.6); } else damagePlayer(b.dmg,b.x,b.y); if(b.chain && !(b.owner&&b.owner.remote&&pvpOff(player,b.owner))){ player.slowT=6; toast('Řetězové koule ti poškodily lanoví!'); } gone=true; }
     if(!gone){ const gz=sampleH(b.x,b.y); if(gz>0 && b.z<gz+10){ smoke(b.x,b.y,gz+10,3,1,0.2); debris(b.x,b.y,gz+10,4,[0.55,0.5,0.4,1]); gone=true; } else if(b.z<=0){ splash(b.x,b.y,1); gone=true; } }
     if(gone) balls.splice(i,1); }
   for(let i=fx.length-1;i>=0;i--){ const f=fx[i]; f.life-=dt; if(f.life<=0){ fx.splice(i,1); continue; }
@@ -2530,6 +2619,7 @@ function draw(){
   for(const d of dockedShips){ if(d.x<R[0]-500||d.x>R[2]+500||d.y<R[1]-300||d.y>R[3]) continue; if(d.m) shipItem(d.x,d.y,d.id,d.m,frameFor(d.m,d.h)); }
   for(const r of MP.remotes.values()){ if(!r.m||r.dk||r.x<R[0]-500||r.x>R[2]+500||r.y<R[1]-300||r.y>R[3]) continue; const sk=r.dead?r.deadT:0; if(sk>=SINK_T) continue; shipItem(r.x,r.y,r.id,r.m,frameFor(r.m,r.heading),0,sinkAlpha(sk),r.id,sk>0?sinkInfo(r,sk):null); }
   for(const n of npcs){ if(n.x<R[0]-500||n.x>R[2]+500||n.y<R[1]-300||n.y>R[3]) continue; const sk=n.st==='sink'?n.sinkT:0; if(sk>=SINK_T) continue; shipItem(n.x,n.y,n.id,n.m,frameFor(n.m,n.heading),0,sinkAlpha(sk),n.id,sk>0?sinkInfo(n,sk):null); }
+  for(const n of MP.gnpc.values()){ if(n.x<R[0]-500||n.x>R[2]+500||n.y<R[1]-300||n.y>R[3]) continue; const sk=n.st==='sink'?n.sinkT:0; if(sk>=SINK_T) continue; shipItem(n.x,n.y,n.id,n.m,frameFor(n.m,n.heading),0,sinkAlpha(sk)*n.alpha,n.id,sk>0?sinkInfo(n,sk):null); }
   if(ship && shipTex.get('P'+player.shipId) && !player.docked){ const sk=player.dead?player.sinkT:0; const snap=shake<=0&&!player.dead; if(sk<SINK_T) shipItem(snap?RC.x:player.x,snap?RC.y:player.y,player.shipId,ship,shipFrame(),0,sinkAlpha(sk),'P'+player.shipId,sk>0?sinkInfo(player,sk):null); }
   shipTexGC();
   monsterSprites(propItem, R); buoySprites(propItem, R); lifeSprites(R);
@@ -2729,7 +2819,7 @@ function drawMini(c,size,big){
   if(life.map){ const x=life.map.x*k, y=life.map.y*k, s=big?11:6; g.save(); g.strokeStyle='#9c1c28'; g.lineWidth=big?4:2.6; g.lineCap='round'; g.beginPath(); g.moveTo(x-s,y-s); g.lineTo(x+s,y+s); g.moveTo(x+s,y-s); g.lineTo(x-s,y+s); g.stroke();
     if(big){ g.font='italic 700 17px "Alegreya SC", Georgia, serif'; g.textAlign='center'; g.fillStyle='#9c1c28'; g.fillText('poklad',x,y-s-10); } g.restore(); }
   if(player.route){ g.strokeStyle='rgba(120,30,30,.9)'; g.lineWidth=big?3:2; g.setLineDash([6,5]); g.beginPath(); g.moveTo(player.x*k,player.y*k); for(let i=player.ri;i<player.route.length;i++) g.lineTo(player.route[i][0]*k,player.route[i][1]*k); g.stroke(); g.setLineDash([]); }
-  g.fillStyle='rgba(61,40,23,.6)'; for(const n of npcs){ g.beginPath(); g.arc(n.x*k,n.y*k,big?3:2,0,7); g.fill(); }
+  g.fillStyle='rgba(61,40,23,.6)'; for(const n of npcs){ g.beginPath(); g.arc(n.x*k,n.y*k,big?3:2,0,7); g.fill(); } for(const n of MP.gnpc.values()){ if(n.gone) continue; g.beginPath(); g.arc(n.x*k,n.y*k,big?3:2,0,7); g.fill(); }
   g.fillStyle='#2f7fd0'; for(const r of MP.remotes.values()){ if(r.dead||r.dk) continue; g.beginPath(); g.arc(r.x*k,r.y*k,big?5:3.4,0,7); g.fill();
     if(big){ g.save(); g.font='600 15px "Alegreya Sans", sans-serif'; g.textAlign='left'; g.lineWidth=3; g.strokeStyle='rgba(243,230,196,.9)'; const t=mpName(r)+'  ⌖'+coordStr(r.x,r.y); g.strokeText(t,r.x*k+8,r.y*k+5); g.fillStyle='#1d4f86'; g.fillText(t,r.x*k+8,r.y*k+5); g.restore(); g.fillStyle='#2f7fd0'; } }
   if(big){ g.save(); g.font='600 13px "Alegreya Sans", sans-serif'; g.fillStyle='rgba(61,40,23,.75)'; g.strokeStyle='rgba(61,40,23,.12)'; g.lineWidth=1;
