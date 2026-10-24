@@ -293,7 +293,7 @@ wss.on('connection', (ws, req) => {
     // odchod ze hry mimo přístav: loď zůstane 15 s na moři a dá se potopit (žádný útěk z boje zavřením hry)
     const p = c.p;
     if (p && !p.dead && !p.dk && typeof p.x === 'number') {
-      const g = { peer: me, acc: c.acc, until: Date.now() + GHOST_MS, hp: Math.max(1, +p.hp || 1), mh: Math.max(1, +p.mh || 1), p: { ...p, sp: 0, sv: [], gh: 1, kb: null } };
+      const g = { peer: me, acc: c.acc, until: Date.now() + GHOST_MS, hp: Math.max(1, +p.hp || 1), mh: Math.max(1, +p.mh || 1), p: { ...p, sp: 0, sv: [], np: [], nsv: [], nh: [], gh: 1, kb: null } };   // opuštěná loď nemá NPC ani salvy
       ghosts.set(me, g); broadcast({ t: 'p', peer: me, p: g.p });
     } else broadcast({ t: 'left', peer: me }); });
   ws.on('error', () => {});
